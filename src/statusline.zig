@@ -10,9 +10,13 @@ pub const Statusline = struct {
     /// Claude Code session id; keys the per-session animation state file.
     session_id: ?[]const u8 = null,
     /// cost.total_api_duration_ms -- ticks only while Claude is doing API
-    /// work, which makes it the "is the session active" signal. Deliberately
-    /// not total_duration_ms, which ticks even when idle.
+    /// work. Fallback "is the session active" signal when no transcript
+    /// path is available. Deliberately not total_duration_ms, which ticks
+    /// even when idle.
     api_duration_ms: ?u64 = null,
+    /// Path to the session's JSONL transcript; its tail is the primary
+    /// busy/idle signal for the gaze animation.
+    transcript_path: ?[]const u8 = null,
 };
 
 /// Owns the arena backing `value`. Caller must `deinit()` when done.
@@ -44,6 +48,7 @@ const Raw = struct {
     context_window: ContextWindow = .{},
     session_id: ?[]const u8 = null,
     cost: Cost = .{},
+    transcript_path: ?[]const u8 = null,
 };
 
 pub fn parse(allocator: std.mem.Allocator, json_bytes: []const u8) !ParsedStatusline {
@@ -62,6 +67,7 @@ pub fn parse(allocator: std.mem.Allocator, json_bytes: []const u8) !ParsedStatus
             .context_window_size = parsed.value.context_window.context_window_size,
             .session_id = parsed.value.session_id,
             .api_duration_ms = parsed.value.cost.total_api_duration_ms,
+            .transcript_path = parsed.value.transcript_path,
         },
     };
 }
@@ -79,6 +85,25 @@ test "extracts session_id and cost.total_api_duration_ms" {
 
     try std.testing.expectEqualStrings("abc-123", result.value.session_id.?);
     try std.testing.expectEqual(@as(?u64, 45000), result.value.api_duration_ms);
+}
+
+test "extracts transcript_path; missing yields null" {
+    const json =
+        \\{
+        \\  "model": { "display_name": "Sonnet" },
+        \\  "transcript_path": "/Users/dev/.claude/projects/x/abc.jsonl"
+        \\}
+    ;
+    const result = try parse(std.testing.allocator, json);
+    defer result.deinit();
+    try std.testing.expectEqualStrings(
+        "/Users/dev/.claude/projects/x/abc.jsonl",
+        result.value.transcript_path.?,
+    );
+
+    const bare = try parse(std.testing.allocator, "{}");
+    defer bare.deinit();
+    try std.testing.expectEqual(@as(?[]const u8, null), bare.value.transcript_path);
 }
 
 test "missing session_id and cost yield nulls" {

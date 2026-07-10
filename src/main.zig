@@ -41,13 +41,18 @@ pub fn main(init: std.process.Init) !void {
         if (f) |b| gpa.free(b);
     };
 
-    // Gaze pick: animate only while the session is actively working, so the
-    // face goes still shortly after Claude stops (like the game between
-    // fights). All three frames stay uploaded; the pick just selects which
-    // image id the placeholder cells reference this run.
+    // Gaze pick: animate the whole time Claude is working -- generating,
+    // running tools, driving subagents -- and go still only once the turn
+    // ends and the session sits waiting for user input (like the game
+    // between fights). The transcript tail is the busy signal; the legacy
+    // work-signal heuristic remains as a fallback when the statusline JSON
+    // carries no transcript path. All three frames stay uploaded; the pick
+    // just selects which image id the placeholder cells reference this run.
     const now_ms = Io.Clock.now(.real, io).toMilliseconds();
     const active = blk: {
         if (!cfg.sprite.animate) break :blk false;
+        if (sl.transcript_path) |tp|
+            break :blk gaze.isBusy(gpa, io, tp, now_ms, gaze.default_grace_ms);
         const tmp_path = environ.getPosix("TMPDIR") orelse "/tmp";
         var state_dir = std.Io.Dir.openDirAbsolute(io, tmp_path, .{}) catch break :blk false;
         defer state_dir.close(io);
