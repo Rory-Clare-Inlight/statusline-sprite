@@ -69,9 +69,10 @@ pub fn visibleWidth(s: []const u8) usize {
 
 /// Like `assembleRows`, but pins the sprite to the horizontal center of a
 /// `term_width`-column terminal: each row is `text ++ padding ++ sprite`,
-/// with the sprite starting at `(term_width - sprite_cols) / 2`. A text line
-/// too long for that keeps a minimum 2-space gap and pushes the sprite right
-/// on its row only. Without sprite rows this is a plain text join.
+/// with the sprite starting at `(term_width - sprite_cols) / 2`. When any
+/// text line would collide, the WHOLE sprite shifts right to the longest
+/// line plus a 2-space gap -- shifting one row alone would tear the face
+/// apart. Without sprite rows this is a plain text join.
 pub fn assembleRowsCentered(
     allocator: std.mem.Allocator,
     sprite_rows: ?[]const []const u8,
@@ -85,6 +86,13 @@ pub fn assembleRowsCentered(
     const center_start: usize =
         if (term_width > sprite_cols) (term_width - sprite_cols) / 2 else 0;
 
+    var widths: [line_count]usize = undefined;
+    var start = center_start;
+    for (0..line_count) |i| {
+        widths[i] = visibleWidth(text_lines[i]);
+        start = @max(start, widths[i] + 2);
+    }
+
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
 
@@ -95,9 +103,7 @@ pub fn assembleRowsCentered(
         // An SGR reset in front of the padding defeats the trim invisibly.
         if (text_lines[i].len == 0) try out.appendSlice(allocator, "\x1b[0m");
         try out.appendSlice(allocator, text_lines[i]);
-        const tw = visibleWidth(text_lines[i]);
-        const start = @max(center_start, tw + 2);
-        try out.appendNTimes(allocator, ' ', start - tw);
+        try out.appendNTimes(allocator, ' ', start - widths[i]);
         try out.appendSlice(allocator, rows[i]);
     }
     return out.toOwnedSlice(allocator);
@@ -199,16 +205,18 @@ test "assembleRowsCentered: SGR in text does not shift the sprite" {
     );
 }
 
-test "assembleRowsCentered: long text clamps to a 2-space gap" {
+test "assembleRowsCentered: long text pushes the WHOLE sprite right, keeping it rectangular" {
     const a = std.testing.allocator;
     const sprite = [_][]const u8{ "S0", "S1", "S2" };
     const long = "abcdefghijklmnopqrst"; // 20 wide > center col 17
     const out = try assembleRowsCentered(a, &sprite, .{ long, "", "" }, 6, 40);
     defer a.free(out);
+    // Every row starts the sprite at col 22 (20 + 2-space gap), not just the
+    // colliding one -- a per-row clamp would tear the face apart.
     try std.testing.expectEqualStrings(
         long ++ "  S0\n" ++
-            "\x1b[0m" ++ " " ** 17 ++ "S1\n" ++
-            "\x1b[0m" ++ " " ** 17 ++ "S2",
+            "\x1b[0m" ++ " " ** 22 ++ "S1\n" ++
+            "\x1b[0m" ++ " " ** 22 ++ "S2",
         out,
     );
 }
