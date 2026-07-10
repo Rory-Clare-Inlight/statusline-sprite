@@ -69,12 +69,88 @@ pub fn isActive(
     return true;
 }
 
-/// Whether Claude is busy -- anything other than sitting at the prompt
-/// waiting for the next user input -- judged by the session transcript.
-/// The JSONL tail is the primary signal (see busyFromTranscriptTail); when
-/// the tail reads idle or unclassifiable, a recent mtime still counts as
-/// busy so the face keeps moving through append gaps mid-generation.
-/// A missing or unreadable transcript reports idle.
+/// A busy/idle verdict plus when its source last changed. When several
+/// sources disagree, the most recently updated one reflects the latest
+/// state, so the newest mtime wins.
+pub const Signal = struct { busy: bool, mtime_ms: i64 };
+
+/// Busy state recorded by Claude Code hooks (see README): the statusline
+/// process can't see the spinner, but hooks fire exactly when it starts
+/// (UserPromptSubmit) and stops (Stop). The flag file holds "busy" or
+/// "idle"; anything else -- including a missing file, i.e. hooks not
+/// configured -- yields null. A busy flag past the ceiling is downgraded
+/// to idle: Stop never fires for a session killed outright.
+pub fn flagSignal(
+    gpa: std.mem.Allocator,
+    io: Io,
+    state_dir: std.Io.Dir,
+    session_id: []const u8,
+    now_ms: i64,
+) ?Signal {
+    const name = std.fmt.allocPrint(gpa, "statusline-sprite-{s}.busy", .{session_id}) catch return null;
+    defer gpa.free(name);
+    const f = state_dir.openFile(io, name, .{ .mode = .read_only }) catch return null;
+    defer f.close(io);
+    const st = f.stat(io) catch return null;
+
+    var buf: [16]u8 = undefined;
+    const n = f.readPositionalAll(io, &buf, 0) catch return null;
+    const content = std.mem.trim(u8, buf[0..n], " \t\r\n");
+    const mtime_ms: i64 = @intCast(@divFloor(st.mtime.nanoseconds, std.time.ns_per_ms));
+
+    if (std.mem.eql(u8, content, "busy"))
+        return .{ .busy = (now_ms - mtime_ms) < busy_ceiling_ms, .mtime_ms = mtime_ms };
+    if (std.mem.eql(u8, content, "idle"))
+        return .{ .busy = false, .mtime_ms = mtime_ms };
+    return null;
+}
+
+/// Busy state inferred from the session transcript. The JSONL tail is the
+/// primary evidence (see busyFromTranscriptTail); when the tail reads idle
+/// or unclassifiable, a recent mtime still counts as busy so the face keeps
+/// moving through append gaps mid-generation. A missing or unreadable
+/// transcript yields null.
+pub fn transcriptSignal(
+    gpa: std.mem.Allocator,
+    io: Io,
+    transcript_path: []const u8,
+    now_ms: i64,
+    grace_ms: i64,
+) ?Signal {
+    const f = std.Io.Dir.cwd().openFile(io, transcript_path, .{ .mode = .read_only }) catch return null;
+    defer f.close(io);
+    const st = f.stat(io) catch return null;
+
+    const read_len: usize = @intCast(@min(st.size, tail_read_len));
+    const offset = st.size - read_len;
+    const buf = gpa.alloc(u8, read_len) catch return null;
+    defer gpa.free(buf);
+    const n = f.readPositionalAll(io, buf, offset) catch return null;
+
+    const mtime_ms: i64 = @intCast(@divFloor(st.mtime.nanoseconds, std.time.ns_per_ms));
+    const age_ms = now_ms - mtime_ms;
+    const busy = if (busyFromTranscriptTail(buf[0..n], offset != 0)) |b|
+        (if (b) age_ms < busy_ceiling_ms else age_ms < grace_ms)
+    else
+        age_ms < grace_ms;
+    return .{ .busy = busy, .mtime_ms = mtime_ms };
+}
+
+/// Combine the hook flag and transcript signals: whichever changed most
+/// recently decides. A Stop hook fires after the final transcript write, so
+/// the flag wins at rest; an interrupt (which fires no Stop hook) appends to
+/// the transcript after any stale busy flag, so the transcript wins there.
+pub fn combine(flag: ?Signal, transcript: ?Signal) ?bool {
+    if (flag) |f| {
+        if (transcript) |t|
+            return if (f.mtime_ms >= t.mtime_ms) f.busy else t.busy;
+        return f.busy;
+    }
+    if (transcript) |t| return t.busy;
+    return null;
+}
+
+/// Convenience for the transcript-only path; see transcriptSignal.
 pub fn isBusy(
     gpa: std.mem.Allocator,
     io: Io,
@@ -82,22 +158,8 @@ pub fn isBusy(
     now_ms: i64,
     grace_ms: i64,
 ) bool {
-    const f = std.Io.Dir.cwd().openFile(io, transcript_path, .{ .mode = .read_only }) catch return false;
-    defer f.close(io);
-    const st = f.stat(io) catch return false;
-
-    const read_len: usize = @intCast(@min(st.size, tail_read_len));
-    const offset = st.size - read_len;
-    const buf = gpa.alloc(u8, read_len) catch return false;
-    defer gpa.free(buf);
-    const n = f.readPositionalAll(io, buf, offset) catch return false;
-
-    const mtime_ms: i64 = @intCast(@divFloor(st.mtime.nanoseconds, std.time.ns_per_ms));
-    const age_ms = now_ms - mtime_ms;
-    if (busyFromTranscriptTail(buf[0..n], offset != 0)) |busy| {
-        if (busy) return age_ms < busy_ceiling_ms;
-    }
-    return age_ms < grace_ms;
+    const sig = transcriptSignal(gpa, io, transcript_path, now_ms, grace_ms) orelse return false;
+    return sig.busy;
 }
 
 /// Classify a transcript tail: true = Claude is working, false = the last
@@ -315,6 +377,52 @@ test "isBusy: missing transcript reports idle" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     try std.testing.expect(!isBusy(a, io, "/nonexistent/nope.jsonl", 0, 5000));
+}
+
+test "flagSignal: busy and idle flags parse; garbage and absence yield null" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const now_ms = Io.Clock.now(.real, io).toMilliseconds();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "statusline-sprite-s1.busy", .data = "busy" });
+    try std.testing.expect(flagSignal(a, io, tmp.dir, "s1", now_ms).?.busy);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "statusline-sprite-s1.busy", .data = "idle\n" });
+    try std.testing.expect(!flagSignal(a, io, tmp.dir, "s1", now_ms).?.busy);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "statusline-sprite-s2.busy", .data = "whatever" });
+    try std.testing.expectEqual(@as(?Signal, null), flagSignal(a, io, tmp.dir, "s2", now_ms));
+    try std.testing.expectEqual(@as(?Signal, null), flagSignal(a, io, tmp.dir, "no-such", now_ms));
+}
+
+test "flagSignal: busy flag past the ceiling downgrades to idle" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "statusline-sprite-s1.busy", .data = "busy" });
+    const now_ms = Io.Clock.now(.real, io).toMilliseconds();
+    try std.testing.expect(!flagSignal(a, io, tmp.dir, "s1", now_ms + busy_ceiling_ms + 1000).?.busy);
+}
+
+test "combine: newest signal wins, lone signals pass through" {
+    const busy_old: Signal = .{ .busy = true, .mtime_ms = 1000 };
+    const idle_new: Signal = .{ .busy = false, .mtime_ms = 2000 };
+    // Stale busy flag vs a transcript that saw an interrupt afterwards.
+    try std.testing.expectEqual(@as(?bool, false), combine(busy_old, idle_new));
+    // Fresh Stop-hook idle flag vs an older busy-shaped transcript tail.
+    try std.testing.expectEqual(@as(?bool, false), combine(idle_new, busy_old));
+    // Flag wins ties (it fires after the transcript write it reacts to).
+    try std.testing.expectEqual(@as(?bool, true), combine(
+        Signal{ .busy = true, .mtime_ms = 2000 },
+        Signal{ .busy = false, .mtime_ms = 2000 },
+    ));
+    try std.testing.expectEqual(@as(?bool, true), combine(busy_old, null));
+    try std.testing.expectEqual(@as(?bool, false), combine(null, idle_new));
+    try std.testing.expectEqual(@as(?bool, null), combine(null, null));
 }
 
 test "isActive: sessions do not share state" {

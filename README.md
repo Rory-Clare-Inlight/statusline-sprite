@@ -67,7 +67,23 @@ sprites/
   face0r.png   # tier 0, looking right (optional)
 ```
 
-A missing gaze frame just means a static face for that tier. Busy versus waiting is read from the tail of the session transcript (`transcript_path` in the statusline JSON): a pending tool call, a running subagent, or an in-flight response all count as busy; a completed turn counts as waiting. When no transcript path is available it falls back to statusline JSON fields that only change during API work (a small state file per session lives in `$TMPDIR`). Opt out entirely with:
+A missing gaze frame just means a static face for that tier. Busy versus waiting is judged from two signals, newest wins:
+
+- **Hook flag (exact, optional).** Claude Code hooks fire precisely when the spinner starts and stops; they can record that to a per-session flag file the sprite reads. Save this as e.g. `~/.claude/statusline-sprite-busy-hook.sh`:
+
+  ```sh
+  #!/bin/sh
+  state="$1"
+  sid=$(sed -n 's/.*"session_id" *: *"\([^"]*\)".*/\1/p' | head -1)
+  [ -n "$sid" ] || exit 0
+  printf %s "$state" > "${TMPDIR:-/tmp}/statusline-sprite-$sid.busy"
+  ```
+
+  and wire it up in `~/.claude/settings.json` hooks: `UserPromptSubmit` -> `sh "$HOME/.claude/statusline-sprite-busy-hook.sh" busy`, and `Stop`, `SessionStart`, `SessionEnd` -> the same command with `idle` (add `"async": true` to each so they never block).
+
+- **Transcript tail (automatic fallback).** The last entry of the session transcript (`transcript_path` in the statusline JSON): a pending tool call, a running subagent, or an in-flight response count as busy; a completed turn or an interrupt counts as waiting. This also covers Esc interrupts, which fire no `Stop` hook.
+
+When neither is available it falls back to statusline JSON fields that only change during API work (a small state file per session lives in `$TMPDIR`). Opt out entirely with:
 
 ```toml
 [sprite]
