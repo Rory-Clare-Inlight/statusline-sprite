@@ -90,6 +90,10 @@ pub fn assembleRowsCentered(
 
     for (0..line_count) |i| {
         if (i > 0) try out.append(allocator, '\n');
+        // Claude Code's statusline renderer left-trims lines that begin with
+        // raw whitespace, which would yank a text-less sprite row to column 0.
+        // An SGR reset in front of the padding defeats the trim invisibly.
+        if (text_lines[i].len == 0) try out.appendSlice(allocator, "\x1b[0m");
         try out.appendSlice(allocator, text_lines[i]);
         const tw = visibleWidth(text_lines[i]);
         const start = @max(center_start, tw + 2);
@@ -170,10 +174,14 @@ test "assembleRowsCentered: sprite starts at (width - cols) / 2" {
     const a = std.testing.allocator;
     const sprite = [_][]const u8{ "S0", "S1", "S2" };
     // width 40, cols 6 -> sprite column 17. "abc" is 3 wide -> 14 pad spaces.
+    // Rows with no text get an SGR-reset guard so renderers that left-trim
+    // whitespace-only lines (Claude Code's statusline) keep the padding.
     const out = try assembleRowsCentered(a, &sprite, .{ "abc", "", "" }, 6, 40);
     defer a.free(out);
     try std.testing.expectEqualStrings(
-        "abc" ++ " " ** 14 ++ "S0\n" ++ " " ** 17 ++ "S1\n" ++ " " ** 17 ++ "S2",
+        "abc" ++ " " ** 14 ++ "S0\n" ++
+            "\x1b[0m" ++ " " ** 17 ++ "S1\n" ++
+            "\x1b[0m" ++ " " ** 17 ++ "S2",
         out,
     );
 }
@@ -184,7 +192,9 @@ test "assembleRowsCentered: SGR in text does not shift the sprite" {
     const out = try assembleRowsCentered(a, &sprite, .{ "\x1b[36mabc\x1b[0m", "", "" }, 6, 40);
     defer a.free(out);
     try std.testing.expectEqualStrings(
-        "\x1b[36mabc\x1b[0m" ++ " " ** 14 ++ "S0\n" ++ " " ** 17 ++ "S1\n" ++ " " ** 17 ++ "S2",
+        "\x1b[36mabc\x1b[0m" ++ " " ** 14 ++ "S0\n" ++
+            "\x1b[0m" ++ " " ** 17 ++ "S1\n" ++
+            "\x1b[0m" ++ " " ** 17 ++ "S2",
         out,
     );
 }
@@ -196,7 +206,9 @@ test "assembleRowsCentered: long text clamps to a 2-space gap" {
     const out = try assembleRowsCentered(a, &sprite, .{ long, "", "" }, 6, 40);
     defer a.free(out);
     try std.testing.expectEqualStrings(
-        long ++ "  S0\n" ++ " " ** 17 ++ "S1\n" ++ " " ** 17 ++ "S2",
+        long ++ "  S0\n" ++
+            "\x1b[0m" ++ " " ** 17 ++ "S1\n" ++
+            "\x1b[0m" ++ " " ** 17 ++ "S2",
         out,
     );
 }
