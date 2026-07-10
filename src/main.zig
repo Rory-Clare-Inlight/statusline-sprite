@@ -121,7 +121,12 @@ pub fn main(init: std.process.Init) !void {
     const text_lines: [rows.line_count][]const u8 = .{ l1, l2, l3 };
 
     const sprite_rows: ?[]const []const u8 = if (have_sprite) sprite_arr[0..] else null;
-    const block = try rows.assembleRows(gpa, sprite_rows, text_lines, "  ");
+    // Centering needs a width; when none could be probed, fall back to the
+    // classic left layout rather than guessing.
+    const block = if (cfg.sprite.@"align" == .center and term_info.width != null)
+        try rows.assembleRowsCentered(gpa, sprite_rows, text_lines, cfg.sprite.box_cols, term_info.width.?)
+    else
+        try rows.assembleRows(gpa, sprite_rows, text_lines, "  ");
     defer gpa.free(block);
 
     const stdout = std.Io.File.stdout();

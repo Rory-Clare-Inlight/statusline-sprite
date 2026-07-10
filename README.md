@@ -45,6 +45,45 @@ faces = ["/path/to/calm.png", "/path/to/worried.png", "/path/to/panic.png"]
 
 If `faces` has fewer entries than tiers, the last entry is reused for the higher tiers. Each face is rendered in a box `box_cols` terminal cells wide, so roughly square images look best.
 
+## Alignment
+
+By default the sprite sits at the left edge with the text beside it. To pin it to the horizontal center of the terminal, like the face in the game's status bar (text stays at the left edge):
+
+```toml
+[sprite]
+align = "center"
+```
+
+The terminal width is probed again on every statusline refresh, so the face re-centers itself when the window is resized or a tmux pane is split. Width comes from `#{pane_width}` inside tmux, from TIOCGWINSZ on /dev/tty otherwise, then from `$COLUMNS`; when no width can be found the layout falls back to left alignment.
+
+## Gaze animation
+
+While Claude is actively working, the face can play the game's idle animation: a random gaze (forward, left, right) roughly every half second, going still shortly after the session idles. Drop two extra frames per tier next to the forward faces and it activates automatically:
+
+```
+sprites/
+  face0.png    # tier 0, looking forward
+  face0l.png   # tier 0, looking left (optional)
+  face0r.png   # tier 0, looking right (optional)
+```
+
+A missing gaze frame just means a static face for that tier. Activity is detected from statusline JSON fields that only change while Claude does API work (a small state file per session lives in `$TMPDIR`). Opt out entirely with:
+
+```toml
+[sprite]
+animate = false
+```
+
+## tmux
+
+Inside tmux the graphics escapes are wrapped in DCS passthrough sequences, which tmux silently drops by default. The sprite will never show until you enable passthrough in `~/.tmux.conf`:
+
+```
+set -g allow-passthrough on
+```
+
+## Claude Code
+
 Then set it as your Claude Code statusline command in `~/.claude/settings.json`:
 
 ```json
