@@ -59,8 +59,12 @@ pub fn main(init: std.process.Init) !void {
     // and a non-graphics host simply drops them (best-effort, matches proto).
     const can_graphics = caps.kitty_capable or caps.tmux;
     dbg.print(gpa, "can_graphics={} image_id={d}\n", .{ can_graphics, image_id }) catch {};
-    if (can_graphics and png_bytes != null) {
-        if (tryGraphics(gpa, io, caps, image_id, png_bytes.?, rows.line_count, cfg.sprite.box_cols, &dbg)) {
+
+    const term_info = probeTerm(gpa, io, caps, environ, &dbg);
+    defer if (term_info.tty_path) |p| gpa.free(p);
+
+    if (can_graphics and png_bytes != null and term_info.tty_path != null) {
+        if (tryGraphics(gpa, io, term_info.tty_path.?, caps.tmux, image_id, png_bytes.?, rows.line_count, cfg.sprite.box_cols, &dbg)) {
             if (kitty.placeholderGrid(gpa, image_id, rows.line_count, cfg.sprite.box_cols) catch null) |g| {
                 grid = g;
                 var count: usize = 0;
@@ -152,50 +156,103 @@ fn detectCaps(environ: std.process.Environ) Caps {
     return .{ .tmux = is_tmux, .kitty_capable = capable, .tmux_pane = pane };
 }
 
+/// What we know about the terminal we render into, probed once per run.
+const TermInfo = struct {
+    /// The tty device graphics escapes are written to. Owned by the caller;
+    /// null when no usable tty was found (graphics are skipped).
+    tty_path: ?[]u8,
+    /// Terminal width in columns, for `align = "center"`. Null when unknown.
+    width: ?u32,
+};
+
+/// Split `tmux display` output of the form `<pane_tty> <pane_width>`.
+/// A missing or non-numeric width yields null; the tty is whatever precedes
+/// the first space (possibly empty).
+fn parseTmuxDisplay(out: []const u8) struct { tty: []const u8, width: ?u32 } {
+    const space = std.mem.indexOfScalar(u8, out, ' ') orelse
+        return .{ .tty = out, .width = null };
+    const width = std.fmt.parseInt(u32, std.mem.trim(u8, out[space + 1 ..], " \t"), 10) catch null;
+    return .{ .tty = out[0..space], .width = width };
+}
+
+/// Terminal width via TIOCGWINSZ on /dev/tty. Null when there is no
+/// controlling terminal (the Claude Code statusline case) or the ioctl fails.
+fn ttyWidth(io: Io) ?u32 {
+    const f = std.Io.Dir.openFileAbsolute(io, "/dev/tty", .{ .mode = .read_only }) catch return null;
+    defer f.close(io);
+    var ws: std.posix.winsize = undefined;
+    const req: c_int = @bitCast(@as(u32, @truncate(std.c.T.IOCGWINSZ)));
+    if (std.c.ioctl(f.handle, req, &ws) != 0) return null;
+    return if (ws.col == 0) null else ws.col;
+}
+
+/// Resolve the graphics tty and terminal width. Inside tmux both come from a
+/// single `tmux display` query pinned to this pane (`-t $TMUX_PANE`) -- without
+/// the pin, `tmux display` resolves the session's *active* pane, which for a
+/// Claude Code statusline subprocess is often a different pane, so the image
+/// would land on the wrong tty. Outside tmux the tty is /dev/tty and the width
+/// comes from TIOCGWINSZ. $COLUMNS is the width fallback of last resort.
+fn probeTerm(
+    gpa: std.mem.Allocator,
+    io: Io,
+    caps: Caps,
+    environ: std.process.Environ,
+    dbg: *std.ArrayList(u8),
+) TermInfo {
+    var info: TermInfo = .{ .tty_path = null, .width = null };
+
+    if (caps.tmux) {
+        const cmd = blk: {
+            if (caps.tmux_pane) |pane|
+                break :blk std.fmt.allocPrint(
+                    gpa,
+                    "tmux display -p -t '{s}' '#{{pane_tty}} #{{pane_width}}'",
+                    .{pane},
+                ) catch null;
+            break :blk gpa.dupe(u8, "tmux display -p '#{pane_tty} #{pane_width}'") catch null;
+        };
+        if (cmd) |c| {
+            defer gpa.free(c);
+            const out = rows.runCommand(gpa, io, c, 1000);
+            defer gpa.free(out);
+            dbg.print(gpa, "tmux_query={s} -> {s}\n", .{ c, out }) catch {};
+            const parsed = parseTmuxDisplay(out);
+            if (parsed.tty.len > 0)
+                info.tty_path = gpa.dupe(u8, parsed.tty) catch null;
+            info.width = parsed.width;
+        }
+    } else {
+        info.tty_path = gpa.dupe(u8, "/dev/tty") catch null;
+        info.width = ttyWidth(io);
+    }
+
+    if (info.width == null) {
+        if (environ.getPosix("COLUMNS")) |cols|
+            info.width = std.fmt.parseInt(u32, cols, 10) catch null;
+    }
+    return info;
+}
+
 /// Open the graphics target and write delete/transmit/placement escapes.
 /// Returns true only if everything succeeded; any failure degrades to no sprite.
 fn tryGraphics(
     gpa: std.mem.Allocator,
     io: Io,
-    caps: Caps,
+    tty_path: []const u8,
+    tmux: bool,
     image_id: u32,
     png: []const u8,
     box_rows: u32,
     box_cols: u32,
     dbg: *std.ArrayList(u8),
 ) bool {
-    var tty_path: []const u8 = "/dev/tty";
-    var owned_path: ?[]u8 = null;
-    defer if (owned_path) |p| gpa.free(p);
-
-    if (caps.tmux) {
-        // Pin the query to THIS pane (-t $TMUX_PANE). Without it, `tmux display`
-        // resolves the session's *active* pane -- which, when we run as a
-        // Claude Code statusline subprocess (no client focus), is often a
-        // different pane, so the image lands on the wrong tty and never shows.
-        const cmd = if (caps.tmux_pane) |pane|
-            std.fmt.allocPrint(gpa, "tmux display -p -t '{s}' '#{{pane_tty}}'", .{pane}) catch return false
-        else
-            gpa.dupe(u8, "tmux display -p '#{pane_tty}'") catch return false;
-        defer gpa.free(cmd);
-
-        const out = rows.runCommand(gpa, io, cmd, 1000);
-        dbg.print(gpa, "tmux_query={s} -> tty={s}\n", .{ cmd, out }) catch {};
-        if (out.len == 0) {
-            gpa.free(out);
-            return false;
-        }
-        owned_path = out;
-        tty_path = out;
-    }
-
     const tty = std.Io.Dir.openFileAbsolute(io, tty_path, .{ .mode = .write_only }) catch |e| {
         dbg.print(gpa, "open tty {s} failed: {}\n", .{ tty_path, e }) catch {};
         return false;
     };
     defer tty.close(io);
 
-    buildAndWrite(gpa, io, tty, caps.tmux, image_id, png, box_rows, box_cols) catch |e| {
+    buildAndWrite(gpa, io, tty, tmux, image_id, png, box_rows, box_cols) catch |e| {
         dbg.print(gpa, "buildAndWrite failed: {}\n", .{e}) catch {};
         return false;
     };
@@ -248,6 +305,30 @@ fn appendMaybeTmux(
     } else {
         try list.appendSlice(gpa, esc);
     }
+}
+
+test "parseTmuxDisplay: tty and width" {
+    const r = parseTmuxDisplay("/dev/ttys004 181");
+    try std.testing.expectEqualStrings("/dev/ttys004", r.tty);
+    try std.testing.expectEqual(@as(?u32, 181), r.width);
+}
+
+test "parseTmuxDisplay: missing width yields null width" {
+    const r = parseTmuxDisplay("/dev/ttys004");
+    try std.testing.expectEqualStrings("/dev/ttys004", r.tty);
+    try std.testing.expectEqual(@as(?u32, null), r.width);
+}
+
+test "parseTmuxDisplay: junk width yields null width" {
+    const r = parseTmuxDisplay("/dev/ttys004 abc");
+    try std.testing.expectEqualStrings("/dev/ttys004", r.tty);
+    try std.testing.expectEqual(@as(?u32, null), r.width);
+}
+
+test "parseTmuxDisplay: empty input" {
+    const r = parseTmuxDisplay("");
+    try std.testing.expectEqualStrings("", r.tty);
+    try std.testing.expectEqual(@as(?u32, null), r.width);
 }
 
 test {
