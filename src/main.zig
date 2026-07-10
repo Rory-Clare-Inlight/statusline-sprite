@@ -1,5 +1,6 @@
 const std = @import("std");
 const config = @import("config.zig");
+const gaze = @import("gaze.zig");
 const statusline = @import("statusline.zig");
 const tier = @import("tier.zig");
 const kitty = @import("kitty.zig");
@@ -29,21 +30,51 @@ pub fn main(init: std.process.Init) !void {
 
     const tokens = tier.tokensFrom(sl);
     const tier_idx = tier.selectTier(tokens, cfg.sprite.scale_tokens, cfg.sprite.tiers);
-    // Base 100 keeps ids <= 255 so they fit a 256-color palette index; the
-    // placeholder cell encodes the id via `38;5;<id>` (see kitty.placeholderGrid).
-    const image_id: u32 = 100 + tier_idx;
+    // Three ids per tier, one per gaze frame. Base 100 keeps every id <= 255
+    // so it fits a 256-color palette index; the placeholder cell encodes the
+    // id via `38;5;<id>` (see kitty.placeholderGrid).
+    const base_id: u32 = 100 + tier_idx * 3;
 
-    const png_bytes = readFace(gpa, io, cfg, tier_idx);
-    defer if (png_bytes) |b| gpa.free(b);
+    const frames = readFaces(gpa, io, cfg, tier_idx);
+    defer for (frames) |f| {
+        if (f) |b| gpa.free(b);
+    };
+
+    // Gaze pick: animate only while the session is actively working, so the
+    // face goes still shortly after Claude stops (like the game between
+    // fights). All three frames stay uploaded; the pick just selects which
+    // image id the placeholder cells reference this run.
+    const now_ms = Io.Clock.now(.real, io).toMilliseconds();
+    const active = blk: {
+        if (!cfg.sprite.animate) break :blk false;
+        const tmp_path = environ.getPosix("TMPDIR") orelse "/tmp";
+        var state_dir = std.Io.Dir.openDirAbsolute(io, tmp_path, .{}) catch break :blk false;
+        defer state_dir.close(io);
+        const sig_src: [2]u64 = .{ sl.api_duration_ms orelse 0, sl.total_input_tokens orelse 0 };
+        const work_sig = std.hash.Wyhash.hash(0, std.mem.asBytes(&sig_src));
+        break :blk gaze.isActive(
+            gpa,
+            io,
+            state_dir,
+            sl.session_id orelse "default",
+            work_sig,
+            now_ms,
+            gaze.default_timeout_ms,
+        );
+    };
+    const available: [3]bool = .{ frames[0] != null, frames[1] != null, frames[2] != null };
+    const chosen = chooseFrame(cfg.sprite.animate, active, now_ms, available);
+    const image_id = base_id + chosen;
 
     const caps = detectCaps(environ);
 
     var dbg: std.ArrayList(u8) = .empty;
     defer dbg.deinit(gpa);
-    dbg.print(gpa, "tmux={} kitty_capable={} tmux_pane={s} png_len={?d} box_cols={d}\n", .{
+    dbg.print(gpa, "tmux={} kitty_capable={} tmux_pane={s} png_len={?d} box_cols={d} active={} chosen={d}\n", .{
         caps.tmux,                      caps.kitty_capable,
-        caps.tmux_pane orelse "(null)", if (png_bytes) |b| b.len else null,
-        cfg.sprite.box_cols,
+        caps.tmux_pane orelse "(null)", if (frames[0]) |b| b.len else null,
+        cfg.sprite.box_cols,            active,
+        chosen,
     }) catch {};
 
     // Best-effort graphics. `grid` backs the sprite-row slices, so it must
@@ -63,8 +94,8 @@ pub fn main(init: std.process.Init) !void {
     const term_info = probeTerm(gpa, io, caps, environ, &dbg);
     defer if (term_info.tty_path) |p| gpa.free(p);
 
-    if (can_graphics and png_bytes != null and term_info.tty_path != null) {
-        if (tryGraphics(gpa, io, term_info.tty_path.?, caps.tmux, image_id, png_bytes.?, rows.line_count, cfg.sprite.box_cols, &dbg)) {
+    if (can_graphics and frames[0] != null and term_info.tty_path != null) {
+        if (tryGraphics(gpa, io, term_info.tty_path.?, caps.tmux, base_id, frames, rows.line_count, cfg.sprite.box_cols, &dbg)) {
             if (kitty.placeholderGrid(gpa, image_id, rows.line_count, cfg.sprite.box_cols) catch null) |g| {
                 grid = g;
                 var count: usize = 0;
@@ -102,6 +133,33 @@ fn readStdin(gpa: std.mem.Allocator, io: Io) ![]u8 {
     var buf: [4096]u8 = undefined;
     var fr = std.Io.File.stdin().readerStreaming(io, &buf);
     return fr.interface.allocRemaining(gpa, .limited(1 << 20));
+}
+
+/// Which gaze frame to show this run. Forward unless animation applies and
+/// the picked frame's sprite actually exists on disk.
+fn chooseFrame(animate: bool, active: bool, now_ms: i64, available: [3]bool) u2 {
+    if (!animate or !active) return gaze.forward;
+    const g = gaze.selectGaze(now_ms);
+    return if (available[g]) g else gaze.forward;
+}
+
+/// Load the tier's face frames: [forward, left, right]. Forward follows the
+/// existing resolution (explicit faces list or dir naming); the gaze frames
+/// only exist in dir-naming mode (face<N>l.png / face<N>r.png). Any failure
+/// yields null for that frame; a missing gaze frame just means a static face.
+fn readFaces(gpa: std.mem.Allocator, io: Io, cfg: config.Config, tier_idx: u32) [3]?[]u8 {
+    var out: [3]?[]u8 = .{ null, null, null };
+    out[0] = readFace(gpa, io, cfg, tier_idx);
+    if (cfg.sprite.faces != null) return out;
+    out[1] = readGazeFrame(gpa, io, cfg.sprite.dir, tier_idx, 'l');
+    out[2] = readGazeFrame(gpa, io, cfg.sprite.dir, tier_idx, 'r');
+    return out;
+}
+
+fn readGazeFrame(gpa: std.mem.Allocator, io: Io, dir: []const u8, tier_idx: u32, suffix: u8) ?[]u8 {
+    const path = std.fmt.allocPrint(gpa, "{s}/face{d}{c}.png", .{ dir, tier_idx, suffix }) catch return null;
+    defer gpa.free(path);
+    return std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20)) catch null;
 }
 
 /// Resolve and read the tier's face PNG. Any failure yields null (no sprite).
@@ -240,8 +298,8 @@ fn tryGraphics(
     io: Io,
     tty_path: []const u8,
     tmux: bool,
-    image_id: u32,
-    png: []const u8,
+    base_id: u32,
+    frames: [3]?[]u8,
     box_rows: u32,
     box_cols: u32,
     dbg: *std.ArrayList(u8),
@@ -252,7 +310,7 @@ fn tryGraphics(
     };
     defer tty.close(io);
 
-    buildAndWrite(gpa, io, tty, tmux, image_id, png, box_rows, box_cols) catch |e| {
+    buildAndWrite(gpa, io, tty, tmux, base_id, frames, box_rows, box_cols) catch |e| {
         dbg.print(gpa, "buildAndWrite failed: {}\n", .{e}) catch {};
         return false;
     };
@@ -260,33 +318,41 @@ fn tryGraphics(
     return true;
 }
 
+/// Upload every available gaze frame (id = base_id + gaze) with its own
+/// virtual placement. Keeping all frames resident means switching gaze is a
+/// pure placeholder fg-color change on stdout -- an atomic cell rewrite with
+/// no transmit race and no flicker.
 fn buildAndWrite(
     gpa: std.mem.Allocator,
     io: Io,
     tty: std.Io.File,
     tmux: bool,
-    image_id: u32,
-    png: []const u8,
+    base_id: u32,
+    frames: [3]?[]u8,
     box_rows: u32,
     box_cols: u32,
 ) !void {
     var payload: std.ArrayList(u8) = .empty;
     defer payload.deinit(gpa);
 
-    {
-        const esc = try kitty.delete(gpa, image_id);
-        defer gpa.free(esc);
-        try appendMaybeTmux(gpa, &payload, tmux, esc);
-    }
-    {
-        const esc = try kitty.transmit(gpa, image_id, png, .{});
-        defer gpa.free(esc);
-        try appendMaybeTmux(gpa, &payload, tmux, esc);
-    }
-    {
-        const esc = try kitty.virtualPlacement(gpa, image_id, box_rows, box_cols);
-        defer gpa.free(esc);
-        try appendMaybeTmux(gpa, &payload, tmux, esc);
+    for (frames, 0..) |maybe_png, g| {
+        const png = maybe_png orelse continue;
+        const id: u32 = base_id + @as(u32, @intCast(g));
+        {
+            const esc = try kitty.delete(gpa, id);
+            defer gpa.free(esc);
+            try appendMaybeTmux(gpa, &payload, tmux, esc);
+        }
+        {
+            const esc = try kitty.transmit(gpa, id, png, .{});
+            defer gpa.free(esc);
+            try appendMaybeTmux(gpa, &payload, tmux, esc);
+        }
+        {
+            const esc = try kitty.virtualPlacement(gpa, id, box_rows, box_cols);
+            defer gpa.free(esc);
+            try appendMaybeTmux(gpa, &payload, tmux, esc);
+        }
     }
 
     try tty.writeStreamingAll(io, payload.items);
@@ -305,6 +371,26 @@ fn appendMaybeTmux(
     } else {
         try list.appendSlice(gpa, esc);
     }
+}
+
+test "chooseFrame: forward when animation is off or session idle" {
+    const all: [3]bool = .{ true, true, true };
+    try std.testing.expectEqual(@as(u2, 0), chooseFrame(false, true, 1234, all));
+    try std.testing.expectEqual(@as(u2, 0), chooseFrame(true, false, 1234, all));
+}
+
+test "chooseFrame: animated pick matches selectGaze and respects availability" {
+    const all: [3]bool = .{ true, true, true };
+    // Find an instant whose gaze is non-forward so the fallback case is real.
+    var t: i64 = 0;
+    while (gaze.selectGaze(t) == 0) t += 500;
+
+    try std.testing.expectEqual(gaze.selectGaze(t), chooseFrame(true, true, t, all));
+
+    // Same instant with that frame missing falls back to forward.
+    var only_forward: [3]bool = .{ true, false, false };
+    try std.testing.expectEqual(@as(u2, 0), chooseFrame(true, true, t, only_forward));
+    _ = &only_forward;
 }
 
 test "parseTmuxDisplay: tty and width" {
@@ -333,6 +419,7 @@ test "parseTmuxDisplay: empty input" {
 
 test {
     _ = @import("config.zig");
+    _ = @import("gaze.zig");
     _ = @import("statusline.zig");
     _ = @import("tier.zig");
     _ = @import("kitty.zig");

@@ -7,6 +7,12 @@ pub const Statusline = struct {
     total_input_tokens: ?u64,
     used_percentage: ?f64,
     context_window_size: ?u64,
+    /// Claude Code session id; keys the per-session animation state file.
+    session_id: ?[]const u8 = null,
+    /// cost.total_api_duration_ms -- ticks only while Claude is doing API
+    /// work, which makes it the "is the session active" signal. Deliberately
+    /// not total_duration_ms, which ticks even when idle.
+    api_duration_ms: ?u64 = null,
 };
 
 /// Owns the arena backing `value`. Caller must `deinit()` when done.
@@ -29,9 +35,15 @@ const ContextWindow = struct {
     context_window_size: ?u64 = null,
 };
 
+const Cost = struct {
+    total_api_duration_ms: ?u64 = null,
+};
+
 const Raw = struct {
     model: Model = .{},
     context_window: ContextWindow = .{},
+    session_id: ?[]const u8 = null,
+    cost: Cost = .{},
 };
 
 pub fn parse(allocator: std.mem.Allocator, json_bytes: []const u8) !ParsedStatusline {
@@ -48,8 +60,36 @@ pub fn parse(allocator: std.mem.Allocator, json_bytes: []const u8) !ParsedStatus
             .total_input_tokens = parsed.value.context_window.total_input_tokens,
             .used_percentage = parsed.value.context_window.used_percentage,
             .context_window_size = parsed.value.context_window.context_window_size,
+            .session_id = parsed.value.session_id,
+            .api_duration_ms = parsed.value.cost.total_api_duration_ms,
         },
     };
+}
+
+test "extracts session_id and cost.total_api_duration_ms" {
+    const json =
+        \\{
+        \\  "session_id": "abc-123",
+        \\  "model": { "display_name": "Sonnet" },
+        \\  "cost": { "total_cost_usd": 1.25, "total_duration_ms": 999999, "total_api_duration_ms": 45000 }
+        \\}
+    ;
+    const result = try parse(std.testing.allocator, json);
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings("abc-123", result.value.session_id.?);
+    try std.testing.expectEqual(@as(?u64, 45000), result.value.api_duration_ms);
+}
+
+test "missing session_id and cost yield nulls" {
+    const json =
+        \\{ "model": { "display_name": "Sonnet" } }
+    ;
+    const result = try parse(std.testing.allocator, json);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(?[]const u8, null), result.value.session_id);
+    try std.testing.expectEqual(@as(?u64, null), result.value.api_duration_ms);
 }
 
 test "extracts nested model.display_name and ignores unrelated fields" {
