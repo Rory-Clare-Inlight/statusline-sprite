@@ -1,6 +1,9 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+/// Horizontal placement of the sprite within the terminal.
+pub const Align = enum { left, center };
+
 pub const Sprite = struct {
     dir: []const u8,
     tiers: u32,
@@ -8,6 +11,10 @@ pub const Sprite = struct {
     box_cols: u32,
     /// Explicit per-tier face paths. Null means "derive from dir" (see `deriveFaces`).
     faces: ?[]const []const u8,
+    @"align": Align,
+    /// Idle gaze animation while the session is active. Only takes effect when
+    /// gaze frames (face<N>l.png / face<N>r.png) exist next to the tier faces.
+    animate: bool,
 };
 
 pub const Line = struct {
@@ -46,6 +53,8 @@ pub fn defaults() Config {
             .scale_tokens = 200000,
             .box_cols = 6,
             .faces = null,
+            .@"align" = .left,
+            .animate = true,
         },
         .line1 = .{ .command = null },
         .line2 = .{ .color = null },
@@ -139,6 +148,14 @@ fn applyKey(a: Allocator, cfg: *Config, table: []const u8, key: []const u8, rhs:
             if (parseInt(u32, rhs)) |v| cfg.sprite.box_cols = v;
         } else if (std.mem.eql(u8, key, "faces")) {
             if (try parseStringArray(a, rhs)) |v| cfg.sprite.faces = v;
+        } else if (std.mem.eql(u8, key, "align")) {
+            // Unknown values keep the default (left), matching the parser's
+            // forgiving posture everywhere else.
+            if (try parseString(a, rhs)) |v| {
+                if (std.mem.eql(u8, v, "center")) cfg.sprite.@"align" = .center;
+            }
+        } else if (std.mem.eql(u8, key, "animate")) {
+            if (parseBool(rhs)) |v| cfg.sprite.animate = v;
         }
     } else if (std.mem.eql(u8, table, "line1")) {
         if (std.mem.eql(u8, key, "command")) {
@@ -169,6 +186,15 @@ fn parseInt(comptime T: type, rhs: []const u8) ?T {
     const hash = std.mem.indexOfScalar(u8, rhs, '#');
     const token = std.mem.trim(u8, if (hash) |h| rhs[0..h] else rhs, " \t");
     return std.fmt.parseInt(T, token, 10) catch null;
+}
+
+/// Parse a bare `true`/`false`, tolerating a trailing `# comment`.
+fn parseBool(rhs: []const u8) ?bool {
+    const hash = std.mem.indexOfScalar(u8, rhs, '#');
+    const token = std.mem.trim(u8, if (hash) |h| rhs[0..h] else rhs, " \t");
+    if (std.mem.eql(u8, token, "true")) return true;
+    if (std.mem.eql(u8, token, "false")) return false;
+    return null;
 }
 
 /// Parse a single-line array of double-quoted strings, e.g. `["a.png", "b.png"]`.
@@ -279,6 +305,40 @@ test "loadFromToml parses a faces array" {
     try std.testing.expectEqual(@as(usize, 2), faces.len);
     try std.testing.expectEqualStrings("a.png", faces[0]);
     try std.testing.expectEqualStrings("b.png", faces[1]);
+}
+
+test "align defaults to left, parses center, junk falls back to left" {
+    const d = defaults();
+    try std.testing.expectEqual(Align.left, d.sprite.@"align");
+
+    const toml =
+        \\[sprite]
+        \\align = "center"
+    ;
+    var cfg = try loadFromToml(std.testing.allocator, toml);
+    defer cfg.deinit();
+    try std.testing.expectEqual(Align.center, cfg.sprite.@"align");
+
+    const junk =
+        \\[sprite]
+        \\align = "diagonal"
+    ;
+    var cfg2 = try loadFromToml(std.testing.allocator, junk);
+    defer cfg2.deinit();
+    try std.testing.expectEqual(Align.left, cfg2.sprite.@"align");
+}
+
+test "animate defaults to true and parses false" {
+    const d = defaults();
+    try std.testing.expectEqual(true, d.sprite.animate);
+
+    const toml =
+        \\[sprite]
+        \\animate = false
+    ;
+    var cfg = try loadFromToml(std.testing.allocator, toml);
+    defer cfg.deinit();
+    try std.testing.expectEqual(false, cfg.sprite.animate);
 }
 
 test "loadFromToml on empty/whitespace input equals defaults" {
